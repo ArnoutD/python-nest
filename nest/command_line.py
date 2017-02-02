@@ -8,18 +8,18 @@ nest.py -- a python interface to the Nest Thermostats
 from __future__ import print_function
 
 import argparse
-# TODO(jkoelker) six?
-import ConfigParser as configparser
 import os
 import sys
 
 from . import nest
 from . import utils
+from . import helpers
 
 
 def parse_args():
     prog = os.path.basename(sys.argv[0])
-    config_file = os.path.sep.join(('~', '.config', prog, 'config'))
+    config_file = os.path.sep.join(('~', '.config', 'nest', 'config'))
+    token_cache = os.path.sep.join(('~', '.config', 'nest', 'token_cache'))
 
     conf_parser = argparse.ArgumentParser(prog=prog, add_help=False)
     conf_parser.add_argument('--conf', default=config_file,
@@ -28,34 +28,25 @@ def parse_args():
 
     args, remaining_argv = conf_parser.parse_known_args()
 
-    defaults = {'celsius': False}
-    config_file = os.path.expanduser(args.conf)
-    if os.path.exists(config_file):
-        config = configparser.SafeConfigParser()
-        config.read([config_file])
-        if config.has_section('nest'):
-            defaults.update(dict(config.items('nest')))
-        else:
-            defaults.update(dict(config.items('DEFAULT')))
+    defaults = helpers.get_config(config_path=args.conf)
 
     description = 'Command line interface to Nest™ Thermostats'
     parser = argparse.ArgumentParser(description=description,
                                      parents=[conf_parser])
 
-    parser.set_defaults(**defaults)
-
     parser.add_argument('--token-cache', dest='token_cache',
+                        default=token_cache,
                         help='auth access token cache file',
                         metavar='TOKEN_CACHE_FILE')
 
     parser.add_argument('-t', '--token', dest='token',
                         help='auth access token', metavar='TOKEN')
 
-    parser.add_argument('-u', '--user', dest='user',
-                        help='username for nest.com', metavar='USER')
+    parser.add_argument('--client-id', dest='client_id',
+                        help='product id on developer.nest.com', metavar='ID')
 
-    parser.add_argument('-p', '--password', dest='password',
-                        help='password for nest.com', metavar='PASSWORD')
+    parser.add_argument('--client-secret', dest='client_secret',
+                        help='product secret for nest.com', metavar='SECRET')
 
     parser.add_argument('-c', '--celsius', dest='celsius', action='store_true',
                         help='use celsius instead of farenheit')
@@ -91,6 +82,8 @@ def parse_args():
                             help='set mode to cool')
     mode_group.add_argument('--heat', action='store_true', default=False,
                             help='set mode to heat')
+    mode_group.add_argument('--eco', action='store_true', default=False,
+                            help='set mode to eco')
     mode_group.add_argument('--range', action='store_true', default=False,
                             help='set mode to range')
     mode_group.add_argument('--off', action='store_true', default=False,
@@ -115,31 +108,38 @@ def parse_args():
 
     subparsers.add_parser('show', help='show everything')
 
+    parser.set_defaults(**defaults)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if args.celsius:
-        display_temp = lambda x: x
-        convert_temp = lambda x: x
+    def _identity(x):
+        return x
 
-    else:
-        display_temp = utils.c_to_f
-        convert_temp = utils.f_to_c
+    display_temp = _identity
 
     cmd = args.command
 
-    token_cache = None
-    if args.token_cache:
-        token_cache = os.path.expanduser(args.token_cache)
+    if args.client_id is None or args.client_secret is None:
+        print("Missing client and secret. Either call with --client-id "
+              "and --client-secret or add to config as client_id and "
+              "client_secret")
+        return
 
-    # NOTE(jkoelker) Token caching is currently broken
-    token_cache = None
+    token_cache = os.path.expanduser(args.token_cache)
 
-    with nest.Nest(args.user, args.password, access_token=args.token,
+    with nest.Nest(client_id=args.client_id, client_secret=args.client_secret,
+                   access_token=args.token,
                    access_token_cache_file=token_cache) as napi:
+
+        if napi.authorization_required:
+            print('Go to ' + napi.authorize_url +
+                  ' to authorize, then enter PIN below')
+            pin = input("PIN: ")
+            napi.request_token(pin)
+
         if cmd == 'away':
             structure = None
 
@@ -153,9 +153,9 @@ def main():
                 if args.serial:
                     serial = args.serial
                 else:
-                    serial = napi.devices[args.index]._serial
+                    serial = napi.thermostats[args.index]._serial
 
-                struct = [s for s in napi.structures for d in s.devices
+                struct = [s for s in napi.structures for d in s.thermostats
                           if d._serial == serial]
                 if struct:
                     structure = struct[0]
@@ -173,18 +173,23 @@ def main():
             return
 
         if args.serial:
-            device = nest.Device(args.serial, napi)
+            device = nest.Thermostat(args.serial, napi)
 
         elif args.structure:
             struct = [s for s in napi.structures if s.name == args.structure]
             if struct:
-                device = struct[0].devices[args.index]
+                device = struct[0].thermostats[args.index]
 
             else:
-                device = napi.structures[0].devices[args.index]
+                device = napi.structures[0].thermostats[args.index]
 
         else:
-            device = napi.devices[args.index]
+            device = napi.thermostats[args.index]
+
+        if args.celsius and device.temperature_scale is 'F':
+            display_temp = utils.f_to_c
+        elif not args.celsius and device.temperature_scale is 'C':
+            display_temp = utils.c_to_f
 
         if cmd == 'temp':
             if args.temperature:
@@ -192,13 +197,10 @@ def main():
                     if device.mode != 'range':
                         device.mode = 'range'
 
-                    lower = convert_temp(args.temperature[0])
-                    upper = convert_temp(args.temperature[1])
-                    device.temperature = (lower, upper)
+                    device.temperature = args.temperature
 
                 else:
-                    temp = convert_temp(args.temperature[0])
-                    device.temperature = temp
+                    device.temperature = args.temperature
 
             print('%0.1f' % display_temp(device.temperature))
 
@@ -213,27 +215,24 @@ def main():
 
         elif cmd == 'mode':
             if args.cool:
-                device.mode('cool')
+                device.mode = 'cool'
 
             elif args.heat:
-                device.mode('heat')
+                device.mode = 'heat'
+
+            elif args.eco:
+                device.mode = 'eco'
 
             elif args.range:
-                device.mode('range')
+                device.mode = 'range'
 
             elif args.off:
-                device.mode('off')
+                device.mode = 'off'
 
             print(device.mode)
 
         elif cmd == 'humid':
             print(device.humidity)
-
-        elif cmd == 'target_hum':
-            if args.humidity:
-                device.target_humidity = args.humidity[0]
-
-            print(device.target_humidity)
 
         elif cmd == 'target':
             target = device.target
@@ -246,24 +245,27 @@ def main():
                 print('%0.1f' % display_temp(target))
 
         elif cmd == 'show':
-            data = device._shared.copy()
-            data.update(device._device)
-
-            for k in sorted(data.keys()):
-                intag = any(intag in k for intag in ('temp', 'away',
-                                                     'threshold'))
-                nottag = any(notag in k for notag in ('type', 'pin_hash',
-                                                      'scale', 'enabled'))
-                if intag and not nottag:
-                    try:
-                        temp_data = '%0.1f' % display_temp(data[k])
-                        print(k + '.'*(35-len(k)) + ':', temp_data)
-
-                    except Exception:
-                        print(k + '.'*(35-len(k)) + ':', data[k])
-
-                else:
-                    print(k + '.'*(35-len(k)) + ':', data[k])
+            # TODO should pad key? old code put : out 35
+            print('Device: %s' % device.name)
+            print('Where: %s' % device.where)
+            print('Away     : %s' % device.structure.away)
+            print('Mode     : %s' % device.mode)
+            print('State    : %s' % device.hvac_state)
+            print('Fan      : %s' % device.fan)
+            print('Temp     : %0.1f%s' % (device.temperature,
+                                          device.temperature_scale))
+            print('Humidity : %0.1f%%' % device.humidity)
+            if isinstance(device.target, tuple):
+                print('Target   : %0.1f-%0.1f%s' % (
+                    display_temp(device.target[0]),
+                    display_temp(device.target[1]),
+                    device.temperature_scale))
+            else:
+                print('Target   : %0.1f%s' % (display_temp(device.target),
+                                              device.temperature_scale))
+            print('Away Heat: %0.1fC' % device.eco_temperature[0])
+            print('Away Cool: %0.1fC' % device.eco_temperature[1])
+            print('Has Leaf : %s' % device.has_leaf)
 
 
 if __name__ == '__main__':
